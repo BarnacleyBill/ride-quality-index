@@ -1,0 +1,323 @@
+# Ride Quality Index - score sensor
+# https://github.com/BarnacleyBill/ride-quality-index
+#
+# Creates sensor.ride_quality_index: a 0-10 score for how good conditions are
+# for a bike ride right now, recalculated every minute. Six factors are each
+# rated 0-10 and combined as a weighted average, with hard stops for nearby
+# lightning, darkness and active rain.
+#
+# Requires sensor.ride_rain_chance_2h from ride_index.yaml.
+# Readings in km/h, m/s, knots, degrees C and km are converted automatically;
+# thresholds and the card use mph and degrees F.
+
+template:
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/1"
+    actions:
+      # ======================= CONFIGURATION =======================
+      # Each factor takes a list of sources, tried in order until one
+      # has a fresh reading.
+      #   entity:      the sensor
+      #   label:       short source name shown on the card
+      #   max_age_min: a reading older than this counts as missing
+      # To leave a factor out entirely, set its list to [] and the
+      # remaining weights scale up to cover it.
+      - variables:
+          wind_sources:
+            - entity: sensor.replace_me_nws_wind_speed
+              label: NWS
+              max_age_min: 120
+            - entity: sensor.replace_me_owm_wind_speed
+              label: OWM
+              max_age_min: 120
+          uv_sources:
+            - entity: sensor.replace_me_owm_uv_index
+              label: OWM
+              max_age_min: 120
+          aqi_sources:
+            - entity: sensor.replace_me_air_quality_index
+              label: AQI station
+              max_age_min: 180
+          # Feels-like: a reported heat index or wind chill is used
+          # first (NWS only reports these when they apply), then the
+          # optional local sensor below, then temp_sources.
+          heat_index_sources:
+            - entity: sensor.replace_me_nws_heat_index
+              label: NWS heat index
+              max_age_min: 120
+          wind_chill_sources:
+            - entity: sensor.replace_me_nws_wind_chill
+              label: NWS wind chill
+              max_age_min: 120
+          temp_sources:
+            - entity: sensor.replace_me_nws_temperature
+              label: NWS
+              max_age_min: 120
+            - entity: sensor.replace_me_owm_feels_like
+              label: OWM
+              max_age_min: 120
+
+          # OPTIONAL local outdoor temperature sensor. Leave "" if you
+          # don't have one. If it reads more than local_temp_max_diff_f
+          # above the first working temp_sources entry (usually sun on
+          # the sensor), that entry is used instead and the card says so.
+          local_temp_entity: ""
+          local_temp_label: Local
+          local_temp_max_age_min: 30
+          local_temp_max_diff_f: 5
+
+          # OPTIONAL lightning distance sensor (e.g. Blitzortung).
+          # Leave "" for none; there is then no lightning hard stop.
+          lightning_entity: ""
+
+          # OPTIONAL "raining now" detection. Either or both can be "".
+          #   rain_rate_entity: current rainfall rate (any value > 0 = raining)
+          #   current_weather_entity: a weather entity; rainy, pouring,
+          #   lightning-rainy, hail or snowy-rainy = raining
+          rain_rate_entity: ""
+          current_weather_entity: weather.replace_me_primary
+      # ===================== END CONFIGURATION =====================
+
+      - variables:
+          inp: >
+            {%- set chains = {
+                'wind': wind_sources, 'uv': uv_sources, 'aqi': aqi_sources,
+                'hi': heat_index_sources, 'wc': wind_chill_sources, 'temp': temp_sources
+              } -%}
+            {%- set kinds = {'wind': 'speed', 'hi': 'temp', 'wc': 'temp', 'temp': 'temp'} -%}
+            {%- set SPEED = {'km/h': 0.621371, 'm/s': 2.23694, 'kn': 1.15078, 'ft/s': 0.681818} -%}
+            {%- set out = namespace(d={}) -%}
+            {%- for k, chain in chains.items() -%}
+              {%- set srcs = (chain or []) | selectattr('entity', 'defined') | selectattr('entity') | list -%}
+              {%- set ns = namespace(r=none, tried=[]) -%}
+              {%- for e in srcs -%}
+                {%- if ns.r is none -%}
+                  {%- set lab = e.label | default('') -%}
+                  {%- set s = expand(e.entity) | first | default(none) -%}
+                  {%- if s is not none and s.state | is_number -%}
+                    {%- set age = ((now() - s.last_reported).total_seconds() / 60) | int -%}
+                    {%- if age <= (e.max_age_min | default(120) | int) -%}
+                      {%- set u = s.attributes.unit_of_measurement | default('') -%}
+                      {%- set v = s.state | float -%}
+                      {%- if kinds.get(k) == 'speed' -%}{%- set v = v * SPEED.get(u, 1) -%}
+                      {%- elif kinds.get(k) == 'temp' and u == '°C' -%}{%- set v = v * 9 / 5 + 32 -%}{%- endif -%}
+                      {%- set ns.r = {'v': v, 'src': lab, 'age': age, 'off': false} -%}
+                    {%- else -%}
+                      {%- set ns.tried = ns.tried + [lab ~ ' ' ~ age ~ 'm old'] -%}
+                    {%- endif -%}
+                  {%- else -%}
+                    {%- set ns.tried = ns.tried + [lab ~ ' ' ~ (s.state if s is not none else 'missing')] -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- set res = ns.r if ns.r is not none else {'v': none, 'src': 'none', 'why': ns.tried | join(', '), 'off': srcs | count == 0} -%}
+              {%- set out.d = dict(out.d, **{k: res}) -%}
+            {%- endfor -%}
+            {{ out.d }}
+          loc: >
+            {%- if not local_temp_entity -%}
+            {{ {'v': none, 'src': 'none', 'why': '', 'off': true} }}
+            {%- else -%}
+              {%- set s = expand(local_temp_entity) | first | default(none) -%}
+              {%- if s is not none and s.state | is_number -%}
+                {%- set age = ((now() - s.last_reported).total_seconds() / 60) | int -%}
+                {%- set v = s.state | float -%}
+                {%- if (s.attributes.unit_of_measurement | default('')) == '°C' -%}{%- set v = v * 9 / 5 + 32 -%}{%- endif -%}
+                {%- if age <= (local_temp_max_age_min | int) -%}
+            {{ {'v': v, 'src': local_temp_label, 'age': age, 'off': false} }}
+                {%- else -%}
+            {{ {'v': none, 'src': 'none', 'why': local_temp_label ~ ' ' ~ age ~ 'm old', 'off': false} }}
+                {%- endif -%}
+              {%- else -%}
+            {{ {'v': none, 'src': 'none', 'why': local_temp_label ~ ' ' ~ (s.state if s is not none else 'missing'), 'off': false} }}
+              {%- endif -%}
+            {%- endif -%}
+          in_rain: >
+            {%- set s = states('sensor.ride_rain_chance_2h') -%}
+            {%- set fa = state_attr('sensor.ride_rain_chance_2h', 'fetched_at') -%}
+            {%- set ft = as_datetime(fa, none) if fa not in [none, 'none'] else none -%}
+            {%- set age = ((now() - ft).total_seconds() / 60) | int if ft is not none else none -%}
+            {%- if s | is_number and age is not none and age <= 120 -%}
+            {{ {'v': s | float, 'src': state_attr('sensor.ride_rain_chance_2h', 'source'), 'age': age, 'off': false} }}
+            {%- else -%}
+            {{ {'v': none, 'src': 'none', 'why': ('forecast ' ~ age ~ 'm old') if age is not none else 'no forecast yet', 'off': false} }}
+            {%- endif -%}
+
+      - variables:
+          r: >
+            {%- macro interp(x, pts) -%}
+              {%- if x <= pts[0][0] -%}{{ pts[0][1] }}
+              {%- elif x >= pts[-1][0] -%}{{ pts[-1][1] }}
+              {%- else -%}
+                {%- set ns = namespace(y=none) -%}
+                {%- for i in range(pts | count - 1) -%}
+                  {%- set a = pts[i] -%}{%- set b = pts[i + 1] -%}
+                  {%- if ns.y is none and x >= a[0] and x <= b[0] -%}
+                    {%- set ns.y = a[1] + (b[1] - a[1]) * (x - a[0]) / (b[0] - a[0]) -%}
+                  {%- endif -%}
+                {%- endfor -%}{{ ns.y }}
+              {%- endif -%}
+            {%- endmacro -%}
+
+            {#- ============ TUNING: weights and band anchors ============
+                Weights are relative; they don't need to add up to 100.
+                Anchors are [reading, score] pairs. Scores slide in a
+                straight line between anchors and hold flat beyond the
+                first and last ones.
+                Units: wind mph, UV index, rain %, AQI, temperature F.
+                ======================================================= -#}
+            {%- set W = {'wind': 25, 'uv': 20, 'rain': 20, 'feels': 15, 'day': 15, 'aqi': 5} -%}
+            {%- set P_WIND = [[4, 10], [8, 7], [12, 4], [15, 1]] -%}
+            {%- set P_UV = [[3, 10], [5, 7], [7, 4], [9, 1]] -%}
+            {%- set P_RAIN = [[20, 10], [40, 7], [60, 4], [80, 1]] -%}
+            {%- set P_AQI = [[50, 10], [100, 7], [150, 4], [200, 1]] -%}
+            {%- set P_COLD = [[30, 1], [40, 4], [50, 7], [60, 10]] -%}
+            {%- set P_HOT = [[78, 10], [85, 7], [92, 4], [100, 1]] -%}
+            {%- set DAYLIGHT_FULL_MIN = 120 -%}
+            {%- set LIGHTNING_MI = 15 -%}
+            {%- set LIGHTNING_MIN = 30 -%}
+            {%- set RAIN_NOW_CAP = 3 -%}
+            {#- Daylight cap: the overall score can't exceed the daylight rating plus this margin -#}
+            {%- set DAY_MARGIN = 1.5 -%}
+
+            {%- set L = {'wind': 'Wind', 'uv': 'UV', 'rain': 'Rain 2h', 'feels': 'Feels like', 'day': 'Daylight', 'aqi': 'AQI'} -%}
+            {%- set f = namespace(s={}, ln={}, total=0, wsum=0, cfg=0, flags=[]) -%}
+
+            {#- Wind, UV, rain chance, AQI -#}
+            {%- set specs = [
+                ['wind', inp.wind, ' mph', P_WIND],
+                ['uv', inp.uv, '', P_UV],
+                ['rain', in_rain, '%', P_RAIN],
+                ['aqi', inp.aqi, '', P_AQI]
+              ] -%}
+            {%- for k, d, unit, pts in specs -%}
+              {%- if not d.off -%}
+                {%- set f.cfg = f.cfg + 1 -%}
+                {%- if d.v is not none -%}
+                  {%- set sub = interp(d.v, pts) | float(0) -%}
+                  {%- set shown = (d.v | round(1)) if k == 'uv' else (d.v | round(0) | int) -%}
+                  {%- set f.s = dict(f.s, **{k: sub}) -%}
+                  {%- set f.total = f.total + W[k] * sub -%}
+                  {%- set f.wsum = f.wsum + W[k] -%}
+                  {%- set f.ln = dict(f.ln, **{k: L[k] ~ ' ' ~ shown ~ unit ~ ' · ' ~ (sub | round(1)) ~ ' (' ~ d.src ~ ')'}) -%}
+                {%- else -%}
+                  {%- set f.ln = dict(f.ln, **{k: L[k] ~ ' unavailable (' ~ d.why ~ ')'}) -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+
+            {#- Feels like: heat index or wind chill when reported, then local sensor (sanity-checked), then temp_sources -#}
+            {%- set feels_cfg = not (inp.hi.off and inp.wc.off and inp.temp.off and loc.off) -%}
+            {%- if inp.hi.v is not none -%}{%- set fl = inp.hi -%}
+            {%- elif inp.wc.v is not none -%}{%- set fl = inp.wc -%}
+            {%- elif loc.v is not none -%}
+              {%- if inp.temp.v is not none and (loc.v - inp.temp.v) > (local_temp_max_diff_f | float) -%}
+                {%- set f.flags = f.flags + [local_temp_label ~ ' sensor reads ' ~ ((loc.v - inp.temp.v) | round(0) | int) ~ '°F above ' ~ inp.temp.src ~ ' (sun?), using ' ~ inp.temp.src] -%}
+                {%- set fl = inp.temp -%}
+              {%- else -%}
+                {%- set fl = loc -%}
+              {%- endif -%}
+            {%- else -%}{%- set fl = inp.temp -%}
+            {%- endif -%}
+            {%- if feels_cfg -%}
+              {%- set f.cfg = f.cfg + 1 -%}
+              {%- if fl.v is not none -%}
+                {%- set t = fl.v -%}
+                {%- if t >= P_COLD[-1][0] and t <= P_HOT[0][0] -%}{%- set fsub = 10.0 -%}
+                {%- elif t < P_COLD[-1][0] -%}{%- set fsub = interp(t, P_COLD) | float(0) -%}
+                {%- else -%}{%- set fsub = interp(t, P_HOT) | float(0) -%}{%- endif -%}
+                {%- set f.s = dict(f.s, **{'feels': fsub}) -%}
+                {%- set f.total = f.total + W['feels'] * fsub -%}
+                {%- set f.wsum = f.wsum + W['feels'] -%}
+                {%- set f.ln = dict(f.ln, **{'feels': 'Feels like ' ~ (t | round(0) | int) ~ '°F · ' ~ (fsub | round(1)) ~ ' (' ~ fl.src ~ ')'}) -%}
+              {%- else -%}
+                {%- set why = [loc.why, inp.temp.why] | select | join(', ') -%}
+                {%- set f.ln = dict(f.ln, **{'feels': 'Feels like unavailable (' ~ why ~ ')'}) -%}
+              {%- endif -%}
+            {%- endif -%}
+
+            {#- Daylight: full score DAYLIGHT_FULL_MIN before civil dusk, sliding to 0 at dusk. Dark = sun below -6 degrees. -#}
+            {%- set f.cfg = f.cfg + 1 -%}
+            {%- set elev = state_attr('sun.sun', 'elevation') | float(0) -%}
+            {%- set dusk = as_datetime(state_attr('sun.sun', 'next_dusk'), none) -%}
+            {%- set dark = elev < -6 -%}
+            {%- set mins = ((dusk - now()).total_seconds() / 60) | int if (dusk is not none and not dark) else 0 -%}
+            {%- set mins = [mins, 0] | max -%}
+            {%- set dsub = [mins * 10 / DAYLIGHT_FULL_MIN, 10.0] | min | float -%}
+            {%- set f.s = dict(f.s, **{'day': dsub}) -%}
+            {%- set f.total = f.total + W['day'] * dsub -%}
+            {%- set f.wsum = f.wsum + W['day'] -%}
+            {%- if dark -%}
+              {%- set f.ln = dict(f.ln, **{'day': 'Daylight dark · 0.0'}) -%}
+            {%- else -%}
+              {%- set f.ln = dict(f.ln, **{'day': 'Daylight ' ~ (mins // 60) ~ 'h ' ~ (mins % 60) ~ 'm to dusk · ' ~ (dsub | round(1))}) -%}
+            {%- endif -%}
+
+            {#- Lightning: unknown = no recent strikes; unavailable = data down (flagged, never treated as clear) -#}
+            {%- set l_cfg = lightning_entity | length > 0 -%}
+            {%- set ls = (expand(lightning_entity) | first | default(none)) if l_cfg else none -%}
+            {%- set l_down = l_cfg and (ls is none or ls.state == 'unavailable') -%}
+            {%- set l_age = ((now() - ls.last_reported).total_seconds() / 60) | int if ls is not none else 9999 -%}
+            {%- set l_mi = none -%}
+            {%- if ls is not none and ls.state | is_number -%}
+              {%- set l_mi = (ls.state | float) * (0.621371 if (ls.attributes.unit_of_measurement | default('')) == 'km' else 1) -%}
+            {%- endif -%}
+            {%- set l_near = (not l_down) and l_mi is not none and l_mi <= LIGHTNING_MI and l_age <= LIGHTNING_MIN -%}
+
+            {#- Raining now -#}
+            {%- set ri = states(rain_rate_entity) if rain_rate_entity else 'unknown' -%}
+            {%- set cw = states(current_weather_entity) if current_weather_entity else 'unknown' -%}
+            {%- set rain_now = (ri | is_number and ri | float > 0) or cw in ['rainy', 'pouring', 'lightning-rainy', 'hail', 'snowy-rainy'] -%}
+
+            {#- Combine -#}
+            {%- set enough = inp.wind.v is not none or in_rain.v is not none -%}
+            {%- set raw = (f.total / f.wsum) if f.wsum > 0 else none -%}
+            {%- if l_near -%}{%- set stop = 'Lightning ' ~ (l_mi | round(0) | int) ~ ' mi away, ' ~ l_age ~ ' min ago' -%}
+            {%- elif dark -%}{%- set stop = 'After dusk' -%}
+            {%- elif rain_now -%}{%- set stop = 'Raining now, capped at ' ~ RAIN_NOW_CAP -%}
+            {%- else -%}{%- set stop = '' -%}{%- endif -%}
+            {%- set day_cap = dsub + DAY_MARGIN -%}
+            {%- set rain_cap = RAIN_NOW_CAP if rain_now else 10 -%}
+            {%- if l_near or dark -%}{%- set score = 0 -%}
+            {%- elif not enough or raw is none -%}{%- set score = none -%}
+            {%- else -%}{%- set score = [raw, rain_cap, day_cap] | min -%}{%- endif -%}
+            {%- set day_capped = score is not none and not (l_near or dark) and raw > day_cap and day_cap < rain_cap -%}
+
+            {%- set lim = (f.s.items() | list | sort(attribute='1') | first)[0] if f.s | count > 0 else '' -%}
+            {%- set ol = namespace(l=[]) -%}
+            {%- if stop -%}{%- set ol.l = ol.l + ['STOP: ' ~ stop] -%}{%- endif -%}
+            {%- if day_capped -%}{%- set ol.l = ol.l + ['Score capped at ' ~ (day_cap | round(1)) ~ ': ' ~ (mins // 60) ~ 'h ' ~ (mins % 60) ~ 'm of daylight left'] -%}{%- endif -%}
+            {%- if l_down -%}{%- set ol.l = ol.l + ['Lightning data unavailable'] -%}{%- endif -%}
+            {%- if not enough -%}{%- set ol.l = ol.l + ['Not enough data: wind and rain both missing'] -%}{%- endif -%}
+            {%- set ol.l = ol.l + f.flags -%}
+            {%- for k in ['wind', 'uv', 'rain', 'feels', 'day', 'aqi'] -%}
+              {%- if k in f.ln -%}{%- set ol.l = ol.l + [f.ln[k]] -%}{%- endif -%}
+            {%- endfor -%}
+            {{ {'score': (score | round(1)) if score is not none else none,
+                'stop': stop,
+                'lines': ol.l,
+                'scored_on': ((f.s | count) ~ ' of ' ~ f.cfg),
+                'limiting': (L[lim] if lim else ''),
+                'lightning': ('not configured' if not l_cfg else ('unavailable' if l_down else 'ok'))} }}
+    sensor:
+      - name: Ride Quality Index
+        unique_id: ride_quality_index
+        icon: mdi:bike
+        state_class: measurement
+        state: "{{ r.score }}"
+        attributes:
+          status: >
+            {%- if r.stop and r.score == 0 -%}No-go
+            {%- elif r.score is none -%}Not enough data
+            {%- elif r.score >= 8 -%}Great
+            {%- elif r.score >= 6 -%}Good
+            {%- elif r.score >= 4 -%}Fair
+            {%- else -%}Poor{%- endif -%}
+          hard_stop: "{{ r.stop }}"
+          lines: "{{ r.lines }}"
+          scored_on: "{{ r.scored_on }}"
+          limiting: "{{ r.limiting }}"
+          lightning_data: "{{ r.lightning }}"

@@ -1,0 +1,200 @@
+# Ride Quality Index - dashboard card
+# https://github.com/BarnacleyBill/ride-quality-index
+#
+# Requires button-card (HACS: custom:button-card).
+# Add to a dashboard: Edit dashboard > Add card > Manual > paste this file.
+#
+# Optional Garmin readiness panel: set SHOW_GARMIN to true in the
+# CONFIGURATION block below. Needs the Garmin Connect HACS integration;
+# the entity IDs listed are that integration's defaults.
+
+type: custom:button-card
+entity: sensor.ride_quality_index
+show_name: false
+show_icon: false
+show_state: false
+tap_action:
+  action: none
+grid_options:
+  columns: full
+styles:
+  card:
+    - padding: 16px
+  grid:
+    - grid-template-areas: '"main"'
+    - grid-template-columns: 1fr
+  custom_fields:
+    main:
+      - width: 100%
+      - text-align: left
+custom_fields:
+  main: |
+    [[[
+      try {
+        // ======================= CONFIGURATION =======================
+        var SHOW_GARMIN = false;
+        var GARMIN = {
+          readiness: 'sensor.garmin_connect_training_readiness',
+          morning: 'sensor.garmin_connect_morning_training_readiness',
+          status: 'sensor.garmin_connect_training_status',
+          recovery: 'sensor.garmin_connect_recovery_time'
+        };
+        // ===================== END CONFIGURATION =====================
+
+        var a = entity.attributes;
+        var num = parseFloat(entity.state);
+        var has = !isNaN(num);
+        var status = a.status || 'Not enough data';
+
+        function bandColor(v) {
+          if (isNaN(v)) return '#7f8c8d';
+          if (v >= 8) return '#2ecc71';
+          if (v >= 6) return '#3498db';
+          if (v >= 4) return '#f39c12';
+          return '#e74c3c';
+        }
+        var col = status === 'No-go' ? '#e74c3c' : (has ? bandColor(num) : '#7f8c8d');
+
+        var lines = a.lines || [];
+        var lim = a.limiting || '';
+        var labels = ['Rain 2h', 'Feels like', 'Daylight', 'Wind', 'UV', 'AQI'];
+        var names = { 'Rain 2h': 'Rain chance', 'Feels like': 'Feels like', 'Daylight': 'Daylight', 'Wind': 'Wind', 'UV': 'UV index', 'AQI': 'Air quality' };
+
+        function g(id) {
+          var e = states[id];
+          if (!e || e.state === 'unknown' || e.state === 'unavailable') return null;
+          return e;
+        }
+        function gv(id) {
+          var e = g(id);
+          if (!e) return '--';
+          var u = e.attributes.unit_of_measurement || '';
+          return e.state + (u ? ' ' + u : '');
+        }
+        function dur(id) {
+          var e = g(id);
+          if (!e) return '--';
+          var v = parseFloat(e.state);
+          if (isNaN(v)) return e.state;
+          var u = (e.attributes.unit_of_measurement || 'h').toLowerCase();
+          var m = (u === 'min' || u === 'mins' || u === 'minutes') ? v : v * 60;
+          m = Math.round(m);
+          if (m <= 0) return 'Recovered';
+          var h = Math.floor(m / 60);
+          var r = m % 60;
+          return (h > 0 ? h + 'h ' : '') + r + 'm';
+        }
+
+        // Split the sensor's lines into alerts and factor rows
+        var alerts = [];
+        var rows = [];
+        for (var i = 0; i < lines.length; i++) {
+          var t = lines[i];
+          var lab = '';
+          for (var k = 0; k < labels.length; k++) {
+            if (t.indexOf(labels[k] + ' ') === 0) { lab = labels[k]; break; }
+          }
+          if (!lab) { alerts.push(t); continue; }
+          var rest = t.slice(lab.length).replace(/^:?\s*/, '');
+          var parts = rest.split(' · ');
+          var reading = parts[0];
+          var scorePart = parts.length > 1 ? parts[1] : '';
+          var src = '';
+          var m1 = scorePart.match(/\(([^)]+)\)/);
+          if (m1) src = m1[1];
+          var sc = parseFloat(scorePart);
+          var missing = false;
+          if (reading.indexOf('unavailable') === 0) {
+            missing = true;
+            var m2 = reading.match(/\(([^)]+)\)/);
+            src = m2 ? m2[1] : '';
+            reading = 'No data';
+            sc = NaN;
+          }
+          rows.push({ lab: lab, reading: reading, src: src, sc: sc, missing: missing });
+        }
+
+        var out = '<div style="display:flex;flex-wrap:wrap;gap:24px;">';
+
+        // LEFT: score tile + factor table
+        out += '<div style="flex:1 1 320px;min-width:0;">';
+        out += '<div style="width:180px;height:180px;margin:0 auto 14px auto;border-radius:18px;background:' + col + ';display:flex;align-items:center;justify-content:center;">';
+        out += '<span style="font-size:72px;font-weight:700;color:#fff;line-height:1;">' + (has ? num.toFixed(1) : '--') + '</span>';
+        out += '</div>';
+        out += '<div style="text-align:center;font-size:13px;opacity:0.7;margin-bottom:12px;">' + status + ' · scored on ' + (a.scored_on || '--') + ' factors</div>';
+
+        for (var x = 0; x < alerts.length; x++) {
+          var at = alerts[x];
+          var isStop = at.indexOf('STOP') === 0;
+          out += '<div style="padding:6px 10px;margin-bottom:6px;border-radius:8px;font-size:14px;font-weight:600;background:' + (isStop ? 'rgba(231,76,60,0.15)' : 'rgba(243,156,18,0.15)') + ';color:' + (isStop ? '#e74c3c' : '#f39c12') + ';">' + at.replace('STOP: ', 'Stop: ') + '</div>';
+        }
+
+        var head = 'font-size:11px;text-transform:uppercase;letter-spacing:0.5px;opacity:0.55;padding-bottom:6px;';
+        out += '<div style="display:grid;grid-template-columns:minmax(90px,1fr) minmax(110px,1.3fr) minmax(130px,1.4fr);gap:0 12px;align-items:center;">';
+        out += '<div style="' + head + '">Factor</div>';
+        out += '<div style="' + head + '">Now</div>';
+        out += '<div style="' + head + '">Score (out of 10)</div>';
+
+        for (var j = 0; j < rows.length; j++) {
+          var rw = rows[j];
+          var isLim = lim && rw.lab === lim && !isNaN(rw.sc) && rw.sc < 10;
+          var c2 = rw.missing ? '#f39c12' : bandColor(rw.sc);
+          var cellTop = 'padding:7px 0;border-top:1px solid rgba(127,127,127,0.2);';
+
+          out += '<div style="' + cellTop + 'font-size:14px;' + (isLim ? 'font-weight:700;box-shadow:inset 3px 0 0 ' + c2 + ';padding-left:8px;' : '') + '">' + names[rw.lab] + '</div>';
+
+          out += '<div style="' + cellTop + '">';
+          out += '<div style="font-size:14px;' + (rw.missing ? 'color:#f39c12;' : '') + '">' + rw.reading + '</div>';
+          if (rw.src) out += '<div style="font-size:11px;opacity:0.55;">' + rw.src + '</div>';
+          out += '</div>';
+
+          out += '<div style="' + cellTop + 'display:flex;align-items:center;gap:8px;">';
+          if (isNaN(rw.sc)) {
+            out += '<span style="font-size:13px;opacity:0.6;">not scored</span>';
+          } else {
+            out += '<div style="flex:1;height:8px;border-radius:4px;background:rgba(127,127,127,0.25);overflow:hidden;">';
+            out += '<div style="width:' + Math.max(0, Math.min(100, rw.sc * 10)) + '%;height:100%;background:' + c2 + ';"></div></div>';
+            out += '<span style="font-size:14px;font-weight:600;min-width:34px;text-align:right;">' + rw.sc.toFixed(1) + '</span>';
+          }
+          out += '</div>';
+        }
+        out += '</div>';
+        out += '</div>';
+
+        // RIGHT: Garmin readiness (optional)
+        if (SHOW_GARMIN) {
+          var tr = g(GARMIN.readiness);
+          var trv = tr ? parseFloat(tr.state) : NaN;
+          var tcol = '#7f8c8d';
+          var tlab = '--';
+          if (!isNaN(trv)) {
+            if (trv < 25) { tcol = '#e74c3c'; tlab = 'Poor'; }
+            else if (trv < 50) { tcol = '#ff8c00'; tlab = 'Low'; }
+            else if (trv < 75) { tcol = '#3498db'; tlab = 'Moderate'; }
+            else if (trv < 95) { tcol = '#2ecc71'; tlab = 'High'; }
+            else { tcol = '#b967ff'; tlab = 'Prime'; }
+          }
+
+          out += '<div style="flex:1 1 220px;min-width:0;">';
+          out += '<div style="font-size:13px;opacity:0.7;margin-bottom:4px;">Training readiness</div>';
+          out += '<div style="font-size:56px;font-weight:700;line-height:1;color:' + tcol + ';">' + (isNaN(trv) ? '--' : Math.round(trv)) + '</div>';
+          out += '<div style="font-size:14px;color:' + tcol + ';margin-bottom:14px;">' + tlab + '</div>';
+
+          var grows = [
+            ['Morning readiness', gv(GARMIN.morning)],
+            ['Training status', gv(GARMIN.status)],
+            ['Recovery time', dur(GARMIN.recovery)]
+          ];
+          for (var q = 0; q < grows.length; q++) {
+            out += '<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:14px;border-top:1px solid rgba(127,127,127,0.2);">';
+            out += '<span style="opacity:0.7;">' + grows[q][0] + '</span><span>' + grows[q][1] + '</span></div>';
+          }
+          out += '</div>';
+        }
+
+        out += '</div>';
+        return out;
+      } catch (e) {
+        return 'Error: ' + e.message;
+      }
+    ]]]

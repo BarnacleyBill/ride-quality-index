@@ -1,0 +1,83 @@
+# Ride Quality Index - forecast helper
+# https://github.com/BarnacleyBill/ride-quality-index
+#
+# Creates sensor.ride_rain_chance_2h: the chance of rain averaged over the
+# next 2 hours, from an hourly weather forecast. Uses a primary weather
+# entity and an optional fallback. If both fail, the last good value is kept
+# and its fetch time is recorded so the score sensor can tell it is stale.
+#
+# Refreshes every 10 minutes and at startup. weather.get_forecasts reads the
+# forecast the weather integration already has, so it adds no API calls.
+
+template:
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/10"
+    actions:
+      # ======================= CONFIGURATION =======================
+      # Both weather entities must provide an HOURLY forecast that
+      # includes precipitation_probability (NWS and OpenWeatherMap
+      # One Call do; check yours in Developer Tools > Actions >
+      # weather.get_forecasts).
+      - variables:
+          primary_weather: weather.replace_me_primary
+          primary_label: NWS
+          # Set to "" if you only have one weather integration.
+          fallback_weather: weather.replace_me_fallback
+          fallback_label: OWM
+      # ===================== END CONFIGURATION =====================
+
+      - action: weather.get_forecasts
+        target:
+          entity_id: "{{ primary_weather }}"
+        data:
+          type: hourly
+        response_variable: fc_primary
+        continue_on_error: true
+      - action: weather.get_forecasts
+        target:
+          entity_id: "{{ fallback_weather if fallback_weather else primary_weather }}"
+        data:
+          type: hourly
+        response_variable: fc_fallback
+        continue_on_error: true
+      - variables:
+          p_rain: >
+            {% set fc = fc_primary[primary_weather].forecast if fc_primary is defined and fc_primary is mapping and primary_weather in fc_primary else [] %}
+            {% set ns = namespace(v=[]) %}
+            {% for f in fc if f.precipitation_probability is number and as_datetime(f.datetime) + timedelta(hours=1) > now() %}
+              {% set ns.v = ns.v + [f.precipitation_probability] %}
+            {% endfor %}
+            {{ ((ns.v[:2] | sum) / 2) | round(0) | int if ns.v | count >= 2 else '' }}
+          f_rain: >
+            {% if not fallback_weather %}{{ '' }}{% else %}
+            {% set fc = fc_fallback[fallback_weather].forecast if fc_fallback is defined and fc_fallback is mapping and fallback_weather in fc_fallback else [] %}
+            {% set ns = namespace(v=[]) %}
+            {% for f in fc if f.precipitation_probability is number and as_datetime(f.datetime) + timedelta(hours=1) > now() %}
+              {% set ns.v = ns.v + [f.precipitation_probability] %}
+            {% endfor %}
+            {{ ((ns.v[:2] | sum) / 2) | round(0) | int if ns.v | count >= 2 else '' }}
+            {% endif %}
+    sensor:
+      - name: Ride Rain Chance 2h
+        unique_id: ride_rain_chance_2h
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:weather-rainy
+        state: >
+          {% if p_rain | is_number %}{{ p_rain }}
+          {% elif f_rain | is_number %}{{ f_rain }}
+          {% elif this.state | is_number %}{{ this.state }}
+          {% else %}{{ none }}{% endif %}
+        attributes:
+          source: >
+            {% if p_rain | is_number %}{{ primary_label }}
+            {% elif f_rain | is_number %}{{ fallback_label }}
+            {% else %}{{ this.attributes.get('source', 'none') }}{% endif %}
+          fetched_at: >
+            {% if p_rain | is_number or f_rain | is_number %}{{ now().isoformat() }}
+            {% else %}{{ this.attributes.get('fetched_at', 'none') }}{% endif %}
+          primary_2h: "{{ p_rain if p_rain | is_number else 'unavailable' }}"
+          fallback_2h: "{{ f_rain if f_rain | is_number else 'unavailable' }}"

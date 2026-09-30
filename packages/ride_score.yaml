@@ -243,7 +243,8 @@ template:
             {%- set f.cfg = f.cfg + 1 -%}
             {%- set elev = state_attr('sun.sun', 'elevation') | float(0) -%}
             {%- set dusk = as_datetime(state_attr('sun.sun', 'next_dusk'), none) -%}
-            {%- set dark = elev < -6 -%}
+            {%- set dawn = as_datetime(state_attr('sun.sun', 'next_dawn'), none) -%}
+            {%- set dark = (dawn < dusk) if (dawn is not none and dusk is not none) else (elev < -6) -%}
             {%- set mins = ((dusk - now()).total_seconds() / 60) | int if (dusk is not none and not dark) else 0 -%}
             {%- set mins = [mins, 0] | max -%}
             {%- set dsub = [mins * 10 / DAYLIGHT_FULL_MIN, 10.0] | min | float -%}
